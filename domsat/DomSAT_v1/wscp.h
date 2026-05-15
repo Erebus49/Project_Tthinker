@@ -11,8 +11,10 @@
 #include <set>
 #include <algorithm>
 #include <utility>
+#include <ilcplex/ilocplex.h>
 
 using namespace std;
+ILOSTLBEGIN
 
 #define mypop(stack) stack[--stack##_fill_pointer]
 #define mypush(item, stack) stack[stack##_fill_pointer++] = item
@@ -1107,124 +1109,139 @@ bool WSCP::update_best_solution()
 
 bool WSCP::search_iteration()
 {
-    if (uncover_stack_fill_pointer == 0)
-    {
-        if (zero_stack_fill_pointer > 0)
-        {
-            int flip_set = select_set_from_zero_stack();
-            if (flip_set == -1)
-                return false;
-            flip(flip_set);
-            return true;
-        }
-        else
-        {
-            update_best_solution();
-        }
-    }
-    if (uncover_stack_fill_pointer > 0)
-    {
-        int selected_uncover_var = uncover_stack[random() % uncover_stack_fill_pointer];
-        int sr = INT_MIN, ct = 1, best_set = 0;
-        int ps = INT_MIN;
-        for (int i = 0; i < var_set_num[selected_uncover_var]; ++i)
-        {
-            int cur_set = var_set[selected_uncover_var][i];
-            if (cc[cur_set] == 0)
-                continue;
-            if (sr == INT_MIN || compare(sr, ct, score[cur_set], cost[cur_set], ps, pscore[cur_set]) < 0)
-            {
-                sr = score[cur_set];
-                ps = pscore[cur_set];
-                ct = cost[cur_set];
-                best_set = cur_set;
-            }
-            else if (compare(sr, ct, score[cur_set], cost[cur_set], ps, pscore[cur_set]) == 0)
-            {
-                if (pscore[best_set] < pscore[cur_set])
-                    best_set = cur_set;
-                else if (pscore[best_set] == pscore[cur_set] && time_stamp[best_set] > time_stamp[cur_set])
-                    best_set = cur_set;
-            }
-        }
-
-        if (cur_cost + cost[best_set] >= best_cost)
-        {
-            int flip_set;
-            flip_set = select_set(0);
-            if (flip_set == -1)
-                return false;
-            if (flip_set < 0)
-            {
-                flip(best_set);
-                return true;
-            }
-            else if (compare(-score[flip_set], cost[flip_set], score[best_set], cost[best_set]) < 0)
-            {
-                if (flip_set == -1 || best_set == -1)
-                    return false;
-
-                flip(flip_set);
-                flip(best_set);
-                time_stamp[flip_set] = step;
-                time_stamp[best_set] = step;
-                if (step % 1000 == 0)
-                {
-                    if (get_runtime() > cutoff_time)
-                        return false;
-                }
-                return true;
-            }
-            else
-            {
-                flip_set = select_set(0);
-                if (flip_set == -1)
-                    return false;
-                flip(flip_set);
-                flip_set = select_set(0);
-                if (flip_set == -1)
-                    return false;
-                if (flip_set >= 0)
-                {
-                    flip(flip_set);
-                    time_stamp[flip_set] = step;
-                }
-
-                if (step % 1000 == 0)
-                {
-                    if (get_runtime() > cutoff_time)
-                        return false;
-                }
-                return true;
-            }
-        }
-        else
-        {
-            if (best_set == -1)
-                return false;
-            flip(best_set);
-            update_weight();
-            time_stamp[best_set] = step;
-            if (step % 1000 == 0)
-            {
-                if (get_runtime() > cutoff_time)
-                    return false;
-            }
-            return true;
-        }
-    }
-    int flip_set = select_set(0);
-    if (flip_set == -1)
+    if (get_runtime() > cutoff_time)
         return false;
-    flip(flip_set);
 
-    time_stamp[flip_set] = step;
-    if (step % 1000 == 0)
+    update_best_solution();
+
+    int k = t;
+    if (k <= 0)
+        return true;
+
+    IloEnv env;
+    try
     {
-        if (get_runtime() > cutoff_time)
+        IloModel model(env);
+        IloBoolVarArray x(env, set_num);
+
+        for (int i = 0; i < set_num; ++i)
+        {
+            if (fix[i] == 1)
+                model.add(x[i] == 1);
+            else if (fix[i] != 0)
+                model.add(x[i] == 0);
+        }
+
+        for (int v = 0; v < var_num; ++v)
+        {
+            if (var_delete[v] == 1)
+                continue;
+            IloExpr cover(env);
+            for (int j = 0; j < var_set_num[v]; ++j)
+            {
+                int s = var_set[v][j];
+                cover += x[s];
+            }
+            model.add(cover >= 1);
+            cover.end();
+        }
+
+        IloExpr hamming(env);
+        int free_count = 0;
+        for (int i = 0; i < set_num; ++i)
+        {
+            if (fix[i] != 0)
+                continue;
+            ++free_count;
+            if (cur_solu[i] == 0)
+                hamming += x[i];
+            else
+                hamming += 1 - x[i];
+        }
+
+        if (free_count == 0)
+        {
+            hamming.end();
+            env.end();
+            return true;
+        }
+
+        model.add(hamming >= 1);
+        if (k < free_count)
+            model.add(hamming <= k);
+        else
+            model.add(hamming <= free_count);
+        hamming.end();
+
+        IloExpr obj_expr(env);
+        for (int i = 0; i < set_num; ++i)
+            obj_expr += cost[i] * x[i];
+
+        model.add(IloMinimize(env, obj_expr));
+
+        long long improve_limit = cur_cost - reduce_cost - 1;
+        if (improve_limit < 0)
+        {
+            obj_expr.end();
+            env.end();
+            return true;
+        }
+        IloNum improve_ub = static_cast<IloNum>(improve_limit);
+        model.add(IloRange(env, -IloInfinity, obj_expr, improve_ub));
+
+        IloCplex cplex(model);
+        cplex.setParam(IloCplex::Param::Advance, 0);
+        cplex.setParam(IloCplex::Param::Threads, 1);
+        cplex.setOut(env.getNullStream());
+
+        double remaining_time = cutoff_time - get_runtime();
+        if (remaining_time <= 0.0)
+        {
+            obj_expr.end();
+            env.end();
             return false;
+        }
+        cplex.setParam(IloCplex::Param::TimeLimit, remaining_time);
+
+        if (cplex.solve())
+        {
+            bool changed = false;
+            for (int i = 0; i < set_num; ++i)
+            {
+                if (fix[i] != 0)
+                    continue;
+                int val = (cplex.getValue(x[i]) > 0.5) ? 1 : 0;
+                if (val != cur_solu[i])
+                {
+                    flip(i);
+                    time_stamp[i] = step;
+                    changed = true;
+                }
+            }
+            obj_expr.end();
+            env.end();
+            if (changed)
+            {
+                update_best_solution();
+                if (uncover_stack_fill_pointer == 0 && cur_cost < best_cost)
+                {
+                    best_cost = cur_cost;
+                    best_time = get_runtime();
+                    for (int i = 0; i < set_num; ++i)
+                        best_solu[i] = cur_solu[i];
+                }
+            }
+            return true;
+        }
+        obj_expr.end();
+        env.end();
+        return true;
     }
-    return true;
+    catch (...)
+    {
+        env.end();
+        return false;
+    }
 }
 
 void WSCP::local_search()
